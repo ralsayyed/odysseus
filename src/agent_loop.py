@@ -2848,6 +2848,8 @@ def _compute_final_metrics(
     prep_timings: Optional[Dict[str, float]] = None,
     backend_gen_tps: float = 0,
     backend_prefill_tps: float = 0,
+    backend_prefill_tokens: Optional[int] = None,
+    backend_cached_tokens: Optional[int] = None,
 ) -> dict:
     """Compute token counts, TPS, and build the final metrics dict."""
     if has_real_usage:
@@ -2901,6 +2903,15 @@ def _compute_final_metrics(
     }
     if backend_prefill_tps and backend_prefill_tps > 0:
         metrics["prefill_tps"] = round(backend_prefill_tps, 2)
+    # Summed across agent rounds, unlike prefill_tps (last round only): a turn
+    # with tool calls prefills several times, and the totals are what explain
+    # the wall-clock. None means the backend never reported it; 0 is a real
+    # reading (cold cache, or a 100% hit leaving nothing to prefill), so these
+    # test against None rather than truthiness.
+    if backend_prefill_tokens is not None:
+        metrics["prefill_tokens"] = backend_prefill_tokens
+    if backend_cached_tokens is not None:
+        metrics["cached_tokens"] = backend_cached_tokens
     if prep_timings:
         prep_total = round(sum(prep_timings.values()), 3)
         metrics["agent_prep_time"] = prep_total
@@ -3824,6 +3835,8 @@ async def stream_agent_loop(
     has_real_usage = False
     backend_gen_tps = 0      # backend-reported true gen speed (llama.cpp timings)
     backend_prefill_tps = 0  # backend-reported prefill speed
+    backend_prefill_tokens = None  # tokens actually prefilled, summed over rounds
+    backend_cached_tokens = None   # prompt tokens served from KV cache, summed
     requested_model = model
     actual_model = model
     total_tool_calls = 0  # for budget enforcement
@@ -4069,6 +4082,14 @@ async def stream_agent_loop(
                             backend_gen_tps = u["gen_tps"]
                         if u.get("prefill_tps"):
                             backend_prefill_tps = u["prefill_tps"]
+                        # Token counts accumulate (every round prefills), unlike
+                        # the rates above which describe the last round only.
+                        # Stay None until the backend actually reports, so
+                        # "not supported" stays distinguishable from a real 0.
+                        if u.get("prefill_tokens") is not None:
+                            backend_prefill_tokens = (backend_prefill_tokens or 0) + u["prefill_tokens"]
+                        if u.get("cached_tokens") is not None:
+                            backend_cached_tokens = (backend_cached_tokens or 0) + u["cached_tokens"]
                     elif data.get("type") == "fallback":
                         # The selected model failed and another answered; surface
                         # the notice so a misconfigured provider isn't masked.
@@ -5222,6 +5243,8 @@ async def stream_agent_loop(
         prep_timings=prep_timings,
         backend_gen_tps=backend_gen_tps,
         backend_prefill_tps=backend_prefill_tps,
+        backend_prefill_tokens=backend_prefill_tokens,
+        backend_cached_tokens=backend_cached_tokens,
     )
     metrics["requested_model"] = requested_model
     yield f"data: {json.dumps({'type': 'metrics', 'data': metrics})}\n\n"

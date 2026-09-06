@@ -38,7 +38,10 @@ python-dateutil
 caldav
 cryptography
 bcrypt
-mcp
+# Pinned: the mcp_servers/ code uses the 1.x low-level Server API
+# (@server.list_tools()). mcp 2.x removes it and every built-in MCP
+# server dies at import with AttributeError.
+mcp<2
 pyotp
 qrcode[pil]
 croniter

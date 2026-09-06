@@ -2594,6 +2594,22 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                             _usage_data["gen_tps"] = round(_tm["predicted_per_second"], 2)
                                         if _tm.get("prompt_per_second"):
                                             _usage_data["prefill_tps"] = round(_tm["prompt_per_second"], 2)
+                                        # prompt_n is what was ACTUALLY prefilled this turn, which is
+                                        # not prompt_tokens once a KV-cache prefix is reused (54 billed
+                                        # vs 4 prefilled is normal on a follow-up turn). prefill_tps is
+                                        # measured over prompt_n alone, so the rate and the count only
+                                        # read honestly when shown together.
+                                        if _tm.get("prompt_n") is not None:
+                                            _usage_data["prefill_tokens"] = _tm["prompt_n"]
+                                        if _tm.get("cache_n") is not None:
+                                            _usage_data["cached_tokens"] = _tm["cache_n"]
+                                    # OpenAI-standard cached-prompt counter. llama.cpp mirrors
+                                    # timings.cache_n here and OpenAI reports its own prompt caching
+                                    # the same way, so cloud endpoints get the metric too. Preferred
+                                    # over cache_n when both are present.
+                                    _ptd = u.get("prompt_tokens_details")
+                                    if isinstance(_ptd, dict) and _ptd.get("cached_tokens") is not None:
+                                        _usage_data["cached_tokens"] = _ptd["cached_tokens"]
                                     if _actual_model:
                                         _usage_data["model"] = _actual_model
                                         if not _same_model_identity(_actual_model, model):

@@ -1915,6 +1915,26 @@ export function displayMetrics(messageElement, metrics) {
     const costStr = cost !== null ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}` : '';
     const costRows = costStr ? `<div><span class="ctx-label">Cost</span> ${costStr}</div>` : '';
     const speedStr = tps != null && tps !== 'undefined' ? `${tps} tok/s` : 'n/a';
+    // Prefill rate is measured over the tokens actually prefilled, not the whole
+    // prompt — on a cache hit those differ by a lot (4 prefilled out of 54
+    // billed is normal), so the rate is shown with its count or it reads as
+    // though the entire prompt went that fast.
+    const prefillTps = metrics.prefill_tps;
+    const prefillTokens = metrics.prefill_tokens;
+    const prefillCount = prefillTokens != null
+      ? ` <span style="opacity:0.6;">(${prefillTokens.toLocaleString()} tokens)</span>` : '';
+    const prefillRow = prefillTps != null
+      ? `<div><span class="ctx-label">Prefill</span> ${prefillTps} tok/s${prefillCount}</div>`
+      : prefillTokens != null
+        ? `<div><span class="ctx-label">Prefill</span> ${prefillTokens.toLocaleString()} tokens</div>`
+        : '';
+    // Hit rate is against the prompt the backend billed, so it stays meaningful
+    // even when prefill_tokens is missing. A 0 is a real reading (cold cache),
+    // hence the null check rather than a truthiness test.
+    const cachedTokens = metrics.cached_tokens;
+    const cacheRow = (cachedTokens != null && inputTokens > 0)
+      ? `<div><span class="ctx-label">Cache</span> ${cachedTokens.toLocaleString()} / ${inputTokens.toLocaleString()} tokens <span style="opacity:0.6;">(${Math.round((cachedTokens / inputTokens) * 100)}% hit)</span></div>`
+      : '';
     const totalTok = inputTokens + outputTokens;
     const ctxColor = ctxPct >= 85 ? 'var(--red, #e06c75)' : ctxPct >= 70 ? '#ff9900' : 'var(--color-muted-alt, #6b7280)';
     const prepTime = metrics.agent_prep_time;
@@ -1940,6 +1960,8 @@ export function displayMetrics(messageElement, metrics) {
       <div><span class="ctx-label">Output</span> ${outputTokens.toLocaleString()} tokens${isReal ? '' : '~'}</div>
       <div><span class="ctx-label">Total</span> ${totalTok.toLocaleString()} tokens</div>
       <div><span class="ctx-label">Speed</span> ${speedStr}</div>
+      ${prefillRow}
+      ${cacheRow}
       <div><span class="ctx-label">Time</span> ${responseTime}s</div>
       ${prepTime != null ? `<div><span class="ctx-label">Prep</span> ${prepTime}s</div>` : ''}
       ${modelWaitTime != null ? `<div><span class="ctx-label">Model wait</span> ${modelWaitTime}s</div>` : ''}
