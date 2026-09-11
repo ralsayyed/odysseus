@@ -104,3 +104,77 @@ def test_inline_attachment_budget_does_not_truncate_small_batches(tmp_path, monk
     assert "=== File: b.txt ===" in content
     assert "Attachment truncated" not in content
     assert "not shown inline" not in content
+
+
+def test_ingestion_notices_classify_partials_and_omissions(tmp_path, monkeypatch):
+    """When files don't fit, each gets a notice and the model gets one report."""
+    import src.document_processor as dp
+
+    monkeypatch.setattr(dp, "MAX_INLINE_ATTACHMENT_CHARS", 1200)
+    monkeypatch.setattr(dp, "MIN_INLINE_ATTACHMENT_SLICE", 200)
+
+    notices = []
+    content = dp.build_user_content(
+        "Summarize all three.",
+        ["a", "b", "c"],
+        str(tmp_path),
+        _UploadHandler(_three_files(tmp_path)),
+        owner="tester",
+        ingestion_notices=notices,
+    )
+    text = content if isinstance(content, str) else content[0]["text"]
+
+    by_name = {n["name"]: n for n in notices}
+    assert set(by_name) == {"a.txt", "b.txt", "c.txt"}
+    assert all(n["status"] == "partial" for n in notices)
+    for n in notices:
+        assert 0 < n["inline_chars"] < n["extracted_chars"]
+    assert "[Attachment ingestion report" in text
+    assert "PARTIAL" in text
+    assert "NOT ingested" in text or "the rest was NOT ingested" in text
+    assert "read_file" in text
+
+
+def test_single_file_over_budget_still_warns(tmp_path, monkeypatch):
+    """One oversized upload is reported too — not just multi-file batches."""
+    import src.document_processor as dp
+
+    monkeypatch.setattr(dp, "MAX_INLINE_ATTACHMENT_CHARS", 1200)
+    monkeypatch.setattr(dp, "MIN_INLINE_ATTACHMENT_SLICE", 200)
+
+    notices = []
+    uploads = {"big": _text_upload(tmp_path, "big", "x" * 4000)}
+    content = dp.build_user_content(
+        "Summarize.",
+        ["big"],
+        str(tmp_path),
+        _UploadHandler(uploads),
+        owner="tester",
+        ingestion_notices=notices,
+    )
+    text = content if isinstance(content, str) else content[0]["text"]
+
+    assert len(notices) == 1
+    assert notices[0]["name"] == "big.txt"
+    assert notices[0]["status"] == "partial"
+    assert "[Attachment ingestion report" in text
+
+
+def test_no_ingestion_report_when_everything_fits(tmp_path, monkeypatch):
+    import src.document_processor as dp
+
+    monkeypatch.setattr(dp, "MAX_INLINE_ATTACHMENT_CHARS", 100000)
+
+    notices = []
+    content = dp.build_user_content(
+        "Summarize.",
+        ["a", "b", "c"],
+        str(tmp_path),
+        _UploadHandler(_three_files(tmp_path)),
+        owner="tester",
+        ingestion_notices=notices,
+    )
+    text = content if isinstance(content, str) else content[0]["text"]
+
+    assert all(n["status"] == "full" for n in notices)
+    assert "[Attachment ingestion report" not in text

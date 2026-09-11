@@ -5,6 +5,7 @@ import os
 import logging
 import mimetypes
 import base64
+import re
 import tempfile
 from typing import List, Dict, Any
 
@@ -19,8 +20,13 @@ MIN_INLINE_ATTACHMENT_SLICE = 500
 # inline, and a conservative characters-per-token rate for extracted text. The
 # fixed 24,000-character budget (~6k tokens) suited small-context models; on a
 # 262k-token model it showed 11 of 79 pages of one PDF and dropped the last two
-# files of a four-PDF upload entirely.
-INLINE_ATTACHMENT_CONTEXT_SHARE = 0.3
+# files of a four-PDF upload entirely. 0.3 still left most of a large window
+# unused: a 64k-token file fit but a second one did not, and the point of a
+# 262k window is to hold big documents whole. Half the window leaves ample
+# room for system prompt, tools, history, and the reply while letting large
+# uploads through; per-file extraction no longer truncates before this budget
+# (see _process_text_file), so the budget is the single size authority.
+INLINE_ATTACHMENT_CONTEXT_SHARE = 0.5
 INLINE_CHARS_PER_TOKEN = 3.5
 
 
@@ -59,7 +65,6 @@ def _process_text_file(path: str) -> str:
     filename = os.path.basename(path)
     _, ext = os.path.splitext(path.lower())
     language = language_map.get(ext, "text")
-    max_len = 30000 if ext != ".log" else 10000
 
     try:
         from src.personal_docs import read_text_file
@@ -84,29 +89,16 @@ def _process_text_file(path: str) -> str:
     except OSError:
         size_str = "unknown"
 
+    # No per-file cap here: text files go through whole and the shared inline
+    # attachment budget (inline_attachment_budget, which scales with the
+    # model's context) is the single authority that trims — with a marker
+    # telling the model exactly how to read the remainder via `read_file`.
+    # The old 30,000-character hard cap truncated a large upload twice (once
+    # here, once in the budget) and made big-context models useless for
+    # whole-file questions.
     lines = content.split("\n")
     line_count = len(lines)
     content_length = len(content)
-    truncated = False
-
-    if content_length > max_len:
-        truncation_point = max_len
-        search_range = min(100, content_length - max_len)
-        for i in range(search_range):
-            if truncation_point + i >= content_length:
-                break
-            if content[truncation_point + i] == "\n":
-                truncation_point += i
-                truncated = True
-                break
-        else:
-            for i in range(min(100, truncation_point)):
-                if content[truncation_point - i] == "\n":
-                    truncation_point -= i
-                    truncated = True
-                    break
-        content = content[:truncation_point]
-        truncated = True
 
     header = f"\n=== File: {filename} ===\n"
     header += f"[Type: {language}, Lines: {line_count}, Size: {size_str} bytes]"
@@ -118,15 +110,10 @@ def _process_text_file(path: str) -> str:
     }
     if ext in code_extensions:
         code_block = f"```{language}\n{content}"
-        if truncated:
-            code_block += "\n[Truncated]"
         code_block += "\n```"
         return header + "\n\n" + code_block
     else:
-        result = header + "\n\n" + content
-        if truncated:
-            result += "\n[Truncated]"
-        return result
+        return header + "\n\n" + content
 
 
 def _process_pdf(path: str, owner: str | None = None, max_chars: int | None = 15000) -> str:
@@ -181,14 +168,6 @@ def _process_pdf(path: str, owner: str | None = None, max_chars: int | None = 15
         return f"\n\n[PDF processing failed: {str(e)}]"
 
 
-def _truncate_inline(text: str, limit: int = 15000) -> tuple[str, str]:
-    """Cap inline document text so a huge file can't blow the model's context."""
-    text = (text or "").strip()
-    if len(text) > limit:
-        return text[:limit], "\n[…truncated for inline context.]"
-    return text, ""
-
-
 def _fit_inline_attachment_text(
     text: str,
     remaining: int,
@@ -196,9 +175,9 @@ def _fit_inline_attachment_text(
 ) -> tuple[str, int]:
     """Fit extracted attachment text into the shared inline attachment budget.
 
-    Individual processors already cap single files, but multi-file batches can
-    still add N capped bodies to one user turn. Keep the first files readable,
-    keep later files visible by name, and mark exactly where inline content was
+    Extraction is whole (text, PDF, Office); this is the single size authority
+    for one attachment, and multi-file batches share the remaining budget so
+    every file stays visible by name. Marks exactly where inline content was
     reduced so the model does not silently miss attachments.
     """
     text = text or ""
@@ -309,6 +288,7 @@ def _process_office_document(
     session_id: str | None = None,
     auto_opened_docs: list[Dict[str, Any]] | None = None,
     owner: str | None = None,
+    out: dict | None = None,
 ) -> str:
     """Extract an Office/EPUB document to Markdown via the optional markitdown dep.
 
@@ -316,7 +296,10 @@ def _process_office_document(
     text, so a missing optional dependency never breaks the chat path. When a
     session_id is provided AND the extraction succeeded, the FULL text is also
     saved as a Document so the agent can page through it via
-    `manage_documents action=read offset=…` after the inline copy is capped.
+    `manage_documents action=read offset=…` when the inline budget trims it.
+
+    When ``out`` is given, it receives "full_len" (chars of the whole
+    extraction) and "doc_id" so callers can report honest ingestion numbers.
     """
     from src.markitdown_runtime import (
         is_markitdown_format,
@@ -330,7 +313,8 @@ def _process_office_document(
     markdown = convert_to_markdown(path)
     if markdown and markdown.strip():
         title = os.path.splitext(os.path.basename(path))[0]
-        body, marker = _truncate_inline(markdown)
+        if out is not None:
+            out["full_len"] = len(markdown)
 
         # Persist the full extracted text as a Document. The agent's existing
         # manage_documents tool can then read past the inline cap with offset.
@@ -361,17 +345,14 @@ def _process_office_document(
                         _db.close()
             except Exception as e:
                 logger.warning("Office auto-doc creation failed for %s: %s", path, e)
+        if out is not None:
+            out["doc_id"] = doc_id
 
-        # Upgrade the truncation marker with a hint pointing at the full doc so
-        # the agent knows it can read the rest.
-        if doc_id and marker:
-            marker = (
-                f"\n[…truncated for inline context — full {len(markdown):,} chars "
-                f"saved as document `{doc_id}`. Use `manage_documents` with "
-                f"action=read, document_id={doc_id}, offset=<N> to page through.]"
-            )
-
-        return f"\n\n[Document content — {title}]:\n{body}{marker}"
+        # Return the FULL markdown — no inline truncation here. The shared
+        # inline attachment budget trims it (and records what was cut); the
+        # old _truncate_inline(15k) cap fought the budget and hid most of a
+        # large docx from big-context models even when the budget allowed it.
+        return f"\n\n[Document content — {title}]:\n{markdown}"
 
     # No content: tell the user whether to install the optional dep or whether
     # the document simply had no extractable text.
@@ -496,6 +477,66 @@ def analyze_image_with_vl(image_path: str, owner: str | None = None) -> str:
     return analyze_image_with_vl_result(image_path, owner=owner).get("text", "")
 
 
+def _classify_ingestion(fitted_text: str, original_len: int) -> str:
+    """Classify a fitted attachment as 'full', 'partial' or 'omitted'.
+
+    Reads the note markers the fitters append; falls back to a length
+    comparison when a marker was lost (e.g. an unusual extraction path).
+    """
+    if "[Attachment not shown inline:" in fitted_text or "[Not shown inline:" in fitted_text:
+        return "omitted"
+    if "[Attachment truncated:" in fitted_text or "[Showing " in fitted_text:
+        return "partial"
+    # The fitters keep the note inside the allowance, so a fitted length far
+    # below the original also means content was cut even if a marker was lost
+    # (e.g. an unusual extraction path).
+    if fitted_text and original_len and len(fitted_text) + 256 < original_len:
+        return "partial"
+    return "full"
+
+
+def _ingestion_report(notices: list, context_tokens: int | None, budget: int) -> str:
+    """Model-facing summary of what was inlined vs dropped from the uploads.
+
+    The per-file fitters already leave a note next to each cut; this block
+    consolidates the accounting so the model cannot mistake a message with a
+    partial file for one that read everything, and says what to do about it.
+    """
+    lines = ["\n\n[Attachment ingestion report — read before answering]"]
+    if context_tokens:
+        lines.append(
+            f"Inline budget for this message: {budget:,} characters "
+            f"(50% of the {context_tokens:,}-token context window)."
+        )
+    else:
+        lines.append(f"Inline budget for this message: {budget:,} characters.")
+    for n in notices:
+        name = n["name"]
+        status = n["status"]
+        if status == "full":
+            lines.append(f"- {name}: SHOWN IN FULL ({n['inline_chars']:,} chars inline)")
+        elif status == "omitted":
+            lines.append(
+                f"- {name}: NOT SHOWN — the inline budget was exhausted before "
+                f"this file ({n['extracted_chars']:,} chars extracted). None of "
+                "its body is in this conversation. Read it with `read_file` "
+                "(path is in the uploaded-files list) before relying on its content."
+            )
+        else:
+            lines.append(
+                f"- {name}: PARTIAL — {n['inline_chars']:,} of {n['extracted_chars']:,} "
+                "chars shown inline; the rest was NOT ingested. Continue reading "
+                "with `read_file` (use offset/limit)"
+                + (f" or `manage_documents` (document_id={n['doc_id']})" if n.get("doc_id") else "")
+                + "."
+            )
+    lines.append(
+        "Un-shown content is unread: do not answer as if you had seen it. "
+        "Fetch it with the tools above if the answer needs it."
+    )
+    return "\n" + "\n".join(lines)
+
+
 def build_user_content(
     text: str,
     attachment_ids: list[str] | None,
@@ -506,6 +547,7 @@ def build_user_content(
     owner: str | None = None,
     resolved_uploads: dict[str, Dict[str, Any]] | None = None,
     context_tokens: int | None = None,
+    ingestion_notices: list | None = None,
 ) -> str | List[Dict[str, Any]]:
     """Build user content with attachments (text, images, audio, documents).
 
@@ -542,6 +584,7 @@ def build_user_content(
         mime = upload_info.get("mime") or mimetypes.guess_type(path)[0] or "application/octet-stream"
         display_name = upload_info.get("name") or upload_info.get("original_name") or path
         pdf_inline = None  # set by the PDF branch: where its full text lives
+        _office_info = None  # set by the office branch: full length + doc_id
 
         if upload_handler.is_image_file(display_name, mime):
             try:
@@ -685,22 +728,31 @@ def build_user_content(
                     except Exception as e:
                         logger.warning(f"PDF auto-doc creation failed for {path}: {e}")
                 if extracted_text is None:
-                    extracted_text = _process_pdf(path, owner=owner)
+                    # max_chars=None: the inline budget is the single size
+                    # authority — the old 15,000-char default here silently
+                    # truncated PDFs whenever viewer-doc creation failed (or
+                    # no session existed) and nothing flagged the loss.
+                    extracted_text = _process_pdf(path, owner=owner, max_chars=None)
             elif mime.startswith("text/") or _is_text_file(path):
                 extracted_text = _process_text_file(path)
             else:
+                _office_info = {}
                 extracted_text = _process_office_document(
                     path,
                     display_name,
                     session_id=session_id,
                     auto_opened_docs=auto_opened_docs,
                     owner=owner,
+                    out=_office_info,
                 )
 
             # Split what's left evenly over the attachments still to come, so a
             # multi-file upload shows the start of every file instead of all of
             # the first and none of the last. Unused share rolls forward.
             _allowance = inline_attachment_remaining // max(1, len(_attachment_ids) - _att_index)
+            _original_len = (
+                len(pdf_inline["body"]) if pdf_inline else len(extracted_text or "")
+            )
             if pdf_inline:
                 extracted_text, _used = _fit_pdf_inline(extracted_text, _allowance, display_name, pdf_inline)
             else:
@@ -709,6 +761,29 @@ def build_user_content(
                 # its note), capped at this file's share.
                 _used = min(len(extracted_text), _allowance)
             inline_attachment_remaining -= _used
+            if ingestion_notices is not None:
+                _status = _classify_ingestion(extracted_text, _original_len)
+                _notice = {
+                    "id": fid,
+                    "name": os.path.basename(display_name or "attachment"),
+                    "status": _status,
+                    "extracted_chars": _original_len,
+                    "inline_chars": len(extracted_text or ""),
+                }
+                if pdf_inline:
+                    _pages = _page_numbers(pdf_inline["body"])
+                    if _pages:
+                        _notice["pages_total"] = max(_pages)
+                    if _status == "partial":
+                        _m = re.search(r"pages 1-(\d+) of", extracted_text or "")
+                        if _m:
+                            _notice["pages_inline"] = int(_m.group(1))
+                    _notice["doc_id"] = pdf_inline.get("doc_id")
+                elif _office_info is not None and _office_info.get("doc_id"):
+                    # Office/EPUB continuations live in a viewer document, not
+                    # in the upload dir — point the report at it.
+                    _notice["doc_id"] = _office_info["doc_id"]
+                ingestion_notices.append(_notice)
             if content and content[0]["type"] == "text":
                 content[0]["text"] += extracted_text
             else:
@@ -718,6 +793,19 @@ def build_user_content(
                 content[0]["text"] += "\n\n[Attached non-text file]"
             else:
                 content.insert(0, {"type": "text", "text": "[Attached non-text file]"})
+
+    # When anything was cut, tell the model explicitly, once, what it did and
+    # did not receive — and how to fetch the rest.
+    if ingestion_notices is not None and any(n["status"] != "full" for n in ingestion_notices):
+        _report = _ingestion_report(
+            ingestion_notices,
+            context_tokens,
+            inline_attachment_budget(context_tokens),
+        )
+        if content and content[0].get("type") == "text":
+            content[0]["text"] += _report
+        else:
+            content.insert(0, {"type": "text", "text": _report.lstrip()})
 
     has_media = any(item.get("type") in ["image_url", "audio"] for item in content if isinstance(item, dict))
     if not has_media and content:

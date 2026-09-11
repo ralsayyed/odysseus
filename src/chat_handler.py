@@ -289,6 +289,7 @@ class ChatHandler:
                 _ctx_tokens = get_context_length(sess.endpoint_url, sess.model)
             except Exception:
                 _ctx_tokens = None
+        _ingestion_notices: list = []
         user_content = build_user_content(
             enhanced_message, effective_att_ids, UPLOAD_DIR, self.upload_handler,
             session_id=getattr(sess, "id", None),
@@ -296,7 +297,16 @@ class ChatHandler:
             owner=owner,
             resolved_uploads=files_by_id,
             context_tokens=_ctx_tokens,
+            ingestion_notices=_ingestion_notices,
         )
+        # Persist each file's ingestion outcome on its attachment meta so the
+        # `attachments` SSE event and re-rendered history can warn the user
+        # that a file was only partially (or not) ingested — the same pattern
+        # the vision description uses.
+        for _notice in _ingestion_notices:
+            _meta = meta_by_id.get(_notice.get("id"))
+            if _meta is not None:
+                _meta["ingestion"] = _notice
 
         # Strip image_url entries for text-only models (VL description is already in the text)
         if not vision_enabled and isinstance(user_content, list):

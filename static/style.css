@@ -18634,6 +18634,13 @@ body.gallery-selecting .gallery-dl-btn,
   opacity: 0.85;
   margin-top: 3px;
 }
+.attach-ingestion-warning {
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--red, #e5484d);
+  margin-top: 3px;
+  white-space: normal;
+}
 .attach-image-name {
   font-size: 10px;
   opacity: 0.5;

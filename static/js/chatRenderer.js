@@ -213,10 +213,33 @@ export function buildAttachCards(attachments) {
         sizeSpan.textContent = _formatSize(att.size);
         card.appendChild(sizeSpan);
       }
+      // Ingestion outcome: warn when the model saw only part of the file (or
+      // none of it) because the message's inline budget ran out. Without this
+      // a truncated upload looks identical to a fully-read one.
+      const _warnText = ingestionWarning(att);
+      if (_warnText) {
+        const warn = document.createElement('div');
+        warn.className = 'attach-ingestion-warning';
+        warn.textContent = _warnText;
+        card.appendChild(warn);
+      }
       attachWrap.appendChild(card);
     }
   }
   return attachWrap;
+}
+
+// Human-readable one-liner for an attachment's ingestion outcome. Empty when
+// the file was fully inlined (or has no ingestion info, e.g. images/audio).
+export function ingestionWarning(att) {
+  const ing = att && att.ingestion;
+  if (!ing || ing.status === 'full' || ing.status === undefined) return '';
+  if (ing.status === 'omitted') {
+    return '⚠ Not ingested — context budget exhausted (' +
+      (ing.extracted_chars || 0).toLocaleString() + ' chars dropped). Model must read it with read_file';
+  }
+  return '⚠ Partially ingested: ' + (ing.inline_chars || 0).toLocaleString() +
+    ' of ' + (ing.extracted_chars || 0).toLocaleString() + ' chars';
 }
 
 // Re-render the attachment cards of an already-rendered message. Used to swap
@@ -2804,6 +2827,7 @@ export function addMessage(role, content, modelName, metadata) {
 const chatRenderer = {
   shortModel,
   sameModelName,
+  ingestionWarning,
   modelRouteLabel,
   replyModelPair,
   modelColor,

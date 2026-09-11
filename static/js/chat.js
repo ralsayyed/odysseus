@@ -2956,7 +2956,29 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
                           _card.style.cursor = 'pointer';
                           _card.onclick = () => window.open(API_BASE + '/api/upload/' + _att.id, '_blank');
                         }
+                        // Warn live when the model saw only part of this file
+                        const _warnText = chatRenderer.ingestionWarning(_att);
+                        if (_warnText && _card && !_card.querySelector('.attach-ingestion-warning')) {
+                          const _warn = document.createElement('div');
+                          _warn.className = 'attach-ingestion-warning';
+                          _warn.textContent = _warnText;
+                          _card.appendChild(_warn);
+                        }
                       }
+                    }
+                    // One summary toast when any upload was only partially
+                    // (or not at all) ingested — the model-visible per-file
+                    // notes cover the model; this covers the user.
+                    const _warned = (json.data || []).filter(_a => _a && _a.ingestion && _a.ingestion.status && _a.ingestion.status !== 'full');
+                    if (_warned.length && uiModule.showToast) {
+                      const _dropped = _warned.reduce((s, _a) =>
+                        s + Math.max(0, (_a.ingestion.extracted_chars || 0) - (_a.ingestion.inline_chars || 0)), 0);
+                      uiModule.showToast(
+                        '⚠ ' + _warned.length + ' attachment' + (_warned.length > 1 ? 's' : '') +
+                        ' not fully ingested — ' + _dropped.toLocaleString() +
+                        ' chars not sent to the model. Ask it to read_file for the rest.',
+                        7000
+                      );
                     }
                   }
                   // Caption / OCR text is no longer rendered as an inline

@@ -67,7 +67,14 @@ FASTEMBED_CACHE_DIR = os.getenv("FASTEMBED_CACHE_PATH") or os.path.join(DATA_DIR
 # Agent tool output limits (single source of truth — imported by tool_execution.py,
 # tool_implementations.py, agent_tools.py, and any other module that needs them)
 MAX_OUTPUT_CHARS = 10_000       # cap for bash/python/web_search/web_fetch output
-MAX_READ_CHARS = 20_000         # cap for read_file / document preview
+# Cap for read_file / document preview, one tool call. Raised from 20,000:
+# large-context models are meant to read whole files, and 20k chars (~5k
+# tokens) forced multi-page reads of big uploads. Env-overridable; paging via
+# offset/limit still works and the context trimmer guards the window.
+try:
+    MAX_READ_CHARS = int(os.getenv("ODYSSEUS_READ_MAX_CHARS") or 100_000)
+except ValueError:
+    MAX_READ_CHARS = 100_000
 MAX_DIFF_LINES = 400            # cap for edit_file unified-diff display
 
 # web_fetch response-size policy (#3812). MAX_OUTPUT_CHARS above only trims
