@@ -102,3 +102,8 @@ compound.config.json
 *.error.log
 _scratch/
 /odysseus/
+
+# Agent session notebook (local only)
+enaai.md
+# Synthetic upload-test file for prefill metrics testing
+prefill-test.txt
