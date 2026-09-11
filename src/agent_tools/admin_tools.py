@@ -549,6 +549,7 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
             "ntfy topic": "reminder_ntfy_topic",
             "webhook integration": "reminder_webhook_integration_id",
             "webhook template": "reminder_webhook_payload_template", "webhook payload": "reminder_webhook_payload_template",
+            "full tool set": "agent_full_toolset_local", "full toolset": "agent_full_toolset_local",
             "agent tool calls": "agent_max_tool_calls", "max tool calls": "agent_max_tool_calls",
             "agent timeout": "agent_stream_timeout_seconds", "stream timeout": "agent_stream_timeout_seconds",
             "token budget": "agent_input_token_budget", "input budget": "agent_input_token_budget",

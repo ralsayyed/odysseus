@@ -1915,25 +1915,33 @@ export function displayMetrics(messageElement, metrics) {
     const costStr = cost !== null ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}` : '';
     const costRows = costStr ? `<div><span class="ctx-label">Cost</span> ${costStr}</div>` : '';
     const speedStr = tps != null && tps !== 'undefined' ? `${tps} tok/s` : 'n/a';
-    // Prefill rate is measured over the tokens actually prefilled, not the whole
-    // prompt — on a cache hit those differ by a lot (4 prefilled out of 54
-    // billed is normal), so the rate is shown with its count or it reads as
-    // though the entire prompt went that fast.
+    // Prefill: tokens the server actually processed (prompt minus cache hits)
+    // and the time spent before the first token. The rate only means something
+    // over a real prefill -- on a warm turn a few dozen new tokens take ~0.5s
+    // that is mostly cache restore, so "65 tok/s" would read as a slow server.
     const prefillTps = metrics.prefill_tps;
     const prefillTokens = metrics.prefill_tokens;
-    const prefillCount = prefillTokens != null
-      ? ` <span style="opacity:0.6;">(${prefillTokens.toLocaleString()} tokens)</span>` : '';
-    const prefillRow = prefillTps != null
-      ? `<div><span class="ctx-label">Prefill</span> ${prefillTps} tok/s${prefillCount}</div>`
-      : prefillTokens != null
-        ? `<div><span class="ctx-label">Prefill</span> ${prefillTokens.toLocaleString()} tokens</div>`
-        : '';
+    const prefillMs = metrics.prefill_ms;
+    let prefillRow = '';
+    if (prefillTokens != null) {
+      const prefillTime = prefillMs != null
+        ? ` · ${(prefillMs / 1000).toFixed(prefillMs < 10000 ? 2 : 1)}s` : '';
+      const prefillRate = (prefillTps != null && prefillTokens >= 512)
+        ? ` <span style="opacity:0.6;">(${Math.round(prefillTps).toLocaleString()} tok/s)</span>` : '';
+      prefillRow = `<div><span class="ctx-label">Prefill</span> ${prefillTokens.toLocaleString()} tokens${prefillTime}${prefillRate}</div>`;
+    } else if (prefillTps != null) {
+      prefillRow = `<div><span class="ctx-label">Prefill</span> ${prefillTps} tok/s</div>`;
+    }
     // Hit rate is against the prompt the backend billed, so it stays meaningful
     // even when prefill_tokens is missing. A 0 is a real reading (cold cache),
     // hence the null check rather than a truthiness test.
     const cachedTokens = metrics.cached_tokens;
+    // One decimal between 99.5% and 100%: rounding 7,019 of 7,050 up to
+    // "100% hit" hid the 31 tokens that still had to be prefilled.
+    const cachePct = inputTokens > 0 ? (cachedTokens / inputTokens) * 100 : 0;
+    const cachePctStr = cachePct >= 99.5 && cachePct < 100 ? cachePct.toFixed(1) : String(Math.round(cachePct));
     const cacheRow = (cachedTokens != null && inputTokens > 0)
-      ? `<div><span class="ctx-label">Cache</span> ${cachedTokens.toLocaleString()} / ${inputTokens.toLocaleString()} tokens <span style="opacity:0.6;">(${Math.round((cachedTokens / inputTokens) * 100)}% hit)</span></div>`
+      ? `<div><span class="ctx-label">Cache</span> ${cachedTokens.toLocaleString()} / ${inputTokens.toLocaleString()} tokens <span style="opacity:0.6;">(${cachePctStr}% hit)</span></div>`
       : '';
     const totalTok = inputTokens + outputTokens;
     const ctxColor = ctxPct >= 85 ? 'var(--red, #e06c75)' : ctxPct >= 70 ? '#ff9900' : 'var(--color-muted-alt, #6b7280)';

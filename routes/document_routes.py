@@ -272,7 +272,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
 
         title = os.path.splitext(meta.get("original_name") or meta.get("name") or upload_id)[0]
         try:
-            body_text = strip_pdf_content_marker(_process_pdf(pdf_path, owner=user))
+            body_text = strip_pdf_content_marker(_process_pdf(pdf_path, owner=user, max_chars=None))
         except Exception:
             body_text = None
 
@@ -527,7 +527,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 raise HTTPException(404, "Source PDF could not be located")
 
             try:
-                body_text = strip_pdf_content_marker(_process_pdf(pdf_path, owner=user))
+                body_text = strip_pdf_content_marker(_process_pdf(pdf_path, owner=user, max_chars=None))
             except Exception as e:
                 logger.error(f"extract_pdf_text failed for {pdf_path}: {e}")
                 raise HTTPException(500, f"Extraction failed: {e}")

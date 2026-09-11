@@ -87,6 +87,35 @@ def _configured_endpoint_kind(url: str) -> Optional[str]:
         return None
 
 
+def _endpoint_headers(url: str) -> Dict[str, str]:
+    """Auth headers for the configured endpoint that serves ``url``.
+
+    A server started with an API key (mlx-serve or llama-server ``--api-key``)
+    answers /slots and /v1/models with 401 when asked without one, and the
+    lookup then fell through to the name table -- 131072 for any "qwen3*"
+    model on a server reporting 262144.
+    """
+    target = _normalize_base_for_compare(url)
+    if not target or "core.database" not in sys.modules:
+        return {}
+    try:
+        from core.database import SessionLocal, ModelEndpoint
+        from src.endpoint_resolver import build_headers
+        db = SessionLocal()
+        try:
+            rows = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True).all()  # noqa: E712
+            for ep in rows:
+                base = _normalize_base_for_compare(getattr(ep, "base_url", "") or "")
+                if base and (target == base or target.startswith(base + "/")):
+                    api_key = getattr(ep, "api_key", None)
+                    return build_headers(api_key, ep.base_url) if api_key else {}
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug(f"No endpoint auth for context lookup on {url}: {e}")
+    return {}
+
+
 def is_local_endpoint(url: str) -> bool:
     """Check if URL points to a local/private/tailscale address."""
     kind = _configured_endpoint_kind(url)
@@ -364,7 +393,7 @@ def _proxy_catalog_context(endpoint_url: str, model: str) -> Optional[int]:
     if cat is None:
         from src.endpoint_resolver import build_models_url
         try:
-            r = httpx.get(build_models_url(endpoint_url), timeout=REQUEST_TIMEOUT)
+            r = httpx.get(build_models_url(endpoint_url), headers=_endpoint_headers(endpoint_url), timeout=REQUEST_TIMEOUT)
         except Exception as e:
             logger.debug(f"Failed to fetch proxy catalog for context length: {e}")
             return None
@@ -421,7 +450,7 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
     if is_local_endpoint(endpoint_url):
         try:
             base = endpoint_url.split("/v1")[0] if "/v1" in endpoint_url else endpoint_url.rsplit("/", 1)[0]
-            r = httpx.get(f"{base}/slots", timeout=REQUEST_TIMEOUT)
+            r = httpx.get(f"{base}/slots", headers=_endpoint_headers(endpoint_url), timeout=REQUEST_TIMEOUT)
             if r.is_success:
                 slots = r.json()
                 if isinstance(slots, list) and slots:
@@ -447,7 +476,9 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
 
     models_url = build_models_url(endpoint_url)
     try:
-        r = httpx.get(models_url, timeout=REQUEST_TIMEOUT)
+        # Sent with the endpoint's key: without it a keyed server 401s and the
+        # lookup falls through to the name table.
+        r = httpx.get(models_url, headers=_endpoint_headers(endpoint_url), timeout=REQUEST_TIMEOUT)
         if r.is_success:
             data = r.json()
             models_list = data.get("data") or []
@@ -457,6 +488,12 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
                 if mid == model or mid.split("/")[-1] == model.split("/")[-1]:
                     api_ctx = _model_ctx_from_entry(m)
                     break
+            # A local server with one model loaded serves it under whatever name
+            # it is asked for (mlx-serve answers a stale id with its loaded
+            # model), so a renamed or re-quantized model still reports its real
+            # window instead of dropping to the name table.
+            if api_ctx is None and len(models_list) == 1 and is_local_endpoint(endpoint_url):
+                api_ctx = _model_ctx_from_entry(models_list[0])
     except Exception as e:
         logger.debug(f"Failed to query context length for {model}: {e}")
 

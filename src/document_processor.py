@@ -15,6 +15,26 @@ logger = logging.getLogger(__name__)
 MAX_INLINE_ATTACHMENT_CHARS = 24000
 MIN_INLINE_ATTACHMENT_SLICE = 500
 
+# Share of the model's context window one message's attachments may fill
+# inline, and a conservative characters-per-token rate for extracted text. The
+# fixed 24,000-character budget (~6k tokens) suited small-context models; on a
+# 262k-token model it showed 11 of 79 pages of one PDF and dropped the last two
+# files of a four-PDF upload entirely.
+INLINE_ATTACHMENT_CONTEXT_SHARE = 0.3
+INLINE_CHARS_PER_TOKEN = 3.5
+
+
+def inline_attachment_budget(context_tokens: int | None) -> int:
+    """Characters of attachment text one message may carry inline.
+
+    Scales with the model's context window, and never drops below the old
+    fixed budget, so small-context models behave exactly as before.
+    """
+    if not context_tokens or context_tokens <= 0:
+        return MAX_INLINE_ATTACHMENT_CHARS
+    scaled = int(context_tokens * INLINE_ATTACHMENT_CONTEXT_SHARE * INLINE_CHARS_PER_TOKEN)
+    return max(MAX_INLINE_ATTACHMENT_CHARS, scaled)
+
 
 def _is_text_file(path: str) -> bool:
     """Check if file has text extension."""
@@ -109,8 +129,13 @@ def _process_text_file(path: str) -> str:
         return result
 
 
-def _process_pdf(path: str, owner: str | None = None) -> str:
-    """Process PDF file with text extraction (pypdf). Uses VL model for image-heavy pages."""
+def _process_pdf(path: str, owner: str | None = None, max_chars: int | None = 15000) -> str:
+    """Process PDF file with text extraction (pypdf). Uses VL model for image-heavy pages.
+
+    ``max_chars`` caps the returned text; the default suits callers that paste
+    it into a short prompt. Pass None for every page: the chat attachment and
+    the viewer document need the whole PDF, not the first ~11 pages of 79.
+    """
     try:
         from pypdf import PdfReader
         pdf_text = ""
@@ -146,8 +171,8 @@ def _process_pdf(path: str, owner: str | None = None) -> str:
                         continue
 
         if pdf_text:
-            if len(pdf_text) > 15000:
-                pdf_text = pdf_text[:15000] + "\n[PDF content truncated]"
+            if max_chars is not None and len(pdf_text) > max_chars:
+                pdf_text = pdf_text[:max_chars] + "\n[PDF content truncated]"
             return f"\n\n[PDF content]:{pdf_text}"
         else:
             return "\n\n[PDF processed but no readable content found]"
@@ -183,20 +208,99 @@ def _fit_inline_attachment_text(
     name = os.path.basename(display_name or "attachment")
     if remaining < MIN_INLINE_ATTACHMENT_SLICE:
         return (
-            f"\n\n[Attachment omitted from inline context: {name}. "
-            f"The {MAX_INLINE_ATTACHMENT_CHARS:,}-character shared inline "
-            "attachment budget was already used by earlier attachments. Ask "
-            "to inspect this file specifically if more detail is needed.]",
+            f"\n\n[Attachment not shown inline: {name}. This message's "
+            "attachments already filled the inline budget. Read the file with "
+            "`read_file` (its path is in the uploaded-files list; use "
+            "offset/limit to page).]",
             0,
         )
     marker = (
-        f"\n\n[Attachment content truncated: {name}. "
-        f"Only {remaining:,} characters of this attachment fit within "
-        f"the {MAX_INLINE_ATTACHMENT_CHARS:,}-character shared inline "
-        "attachment budget. Ask to inspect this file specifically if more "
-        "detail is needed.]"
+        f"\n\n[Attachment truncated: {name}. Only the first {remaining:,} "
+        "characters are shown inline. Read the rest with `read_file` (its "
+        "path is in the uploaded-files list; use offset/limit to page).]"
     )
     return text[:remaining] + marker, 0
+
+
+_PAGE_MARK_RE = None
+
+
+def _page_numbers(text: str) -> list[int]:
+    """Page numbers from the ``[Page N text]`` / ``[Page N image k text]`` markers."""
+    global _PAGE_MARK_RE
+    if _PAGE_MARK_RE is None:
+        import re
+        _PAGE_MARK_RE = re.compile(r"\[Page (\d+) (?:text|image)")
+    return [int(n) for n in _PAGE_MARK_RE.findall(text or "")]
+
+
+def _doc_body_start(doc_id: str, body: str) -> int | None:
+    """Offset of ``body`` inside a document's stored content, for paged reads."""
+    if not doc_id or not body:
+        return None
+    try:
+        from src.database import SessionLocal, Document
+        db = SessionLocal()
+        try:
+            doc = db.query(Document).filter(Document.id == doc_id).first()
+            content = (doc.current_content or "") if doc else ""
+        finally:
+            db.close()
+        start = content.find(body[:200])
+        return start if start >= 0 else None
+    except Exception:
+        return None
+
+
+def _fit_pdf_inline(text: str, allowance: int, display_name: str, info: Dict[str, Any]) -> tuple[str, int]:
+    """Fit a PDF attachment's inline text into ``allowance`` characters.
+
+    Returns (text, characters used). When the PDF doesn't fit, the text is cut
+    at a line boundary and ends with a note saying which pages are shown and
+    exactly where to continue in the viewer document -- which holds every
+    page -- with ``manage_documents``. The old note sent the model to "the
+    document viewer", which itself held only the first 15,000 characters.
+    """
+    if len(text) <= allowance:
+        return text, len(text)
+    name = os.path.basename(display_name or "attachment")
+    body = info.get("body") or ""
+    doc_id = info.get("doc_id")
+    base = info.get("doc_body_start")
+    pages = _page_numbers(body)
+    total_pages = max(pages) if pages else None
+    body_at = text.find(body[:200]) if body else -1
+    head = text[:body_at] if body_at >= 0 else ""
+    how = (
+        f"read it with `manage_documents` action=read document_id={doc_id}"
+        + (f" offset={{offset}}" if base is not None else " (start at offset=0)")
+        + " -- each read returns next_offset."
+    )
+    reserve = 420  # room for the note itself
+    room = allowance - len(head) - reserve
+    if body_at < 0 or room < MIN_INLINE_ATTACHMENT_SLICE:
+        size = f"{total_pages} pages, " if total_pages else ""
+        note = (
+            f"\n\n[Not shown inline: {name} ({size}{len(body):,} characters). "
+            "This message's attachments already filled the inline budget. "
+            "Every page is in the viewer document: "
+            + how.format(offset=base or 0) + "]"
+        )
+        kept = head.rstrip() + note
+        return kept, min(allowance, len(kept))
+    cut = body.rfind("\n", 0, room)
+    if cut < int(room * 0.8):
+        cut = room
+    shown_pages = _page_numbers(body[:cut])
+    last = max(shown_pages) if shown_pages else None
+    span = f"pages 1-{last} of {total_pages}" if last and total_pages else f"the first {cut:,} characters"
+    note = (
+        f"\n\n[Showing {span} of {name} ({cut:,} of {len(body):,} characters). "
+        "Every page is in the viewer document; to read on, "
+        + how.format(offset=(base or 0) + cut) + "]"
+    )
+    kept = head + body[:cut] + note
+    return kept, min(allowance, len(kept))
 
 
 def _process_office_document(
@@ -401,6 +505,7 @@ def build_user_content(
     auto_opened_docs: list[Dict[str, Any]] | None = None,
     owner: str | None = None,
     resolved_uploads: dict[str, Dict[str, Any]] | None = None,
+    context_tokens: int | None = None,
 ) -> str | List[Dict[str, Any]]:
     """Build user content with attachments (text, images, audio, documents).
 
@@ -411,9 +516,10 @@ def build_user_content(
     frontend can switch to the new doc immediately.
     """
     content = [{"type": "text", "text": text}]
-    inline_attachment_remaining = MAX_INLINE_ATTACHMENT_CHARS
+    inline_attachment_remaining = inline_attachment_budget(context_tokens)
 
-    for fid in attachment_ids or []:
+    _attachment_ids = list(attachment_ids or [])
+    for _att_index, fid in enumerate(_attachment_ids):
         upload_info = (resolved_uploads or {}).get(fid)
         if upload_info is None and hasattr(upload_handler, "resolve_upload"):
             upload_info = upload_handler.resolve_upload(fid, owner=owner)
@@ -435,6 +541,7 @@ def build_user_content(
         _, ext = os.path.splitext(path.lower())
         mime = upload_info.get("mime") or mimetypes.guess_type(path)[0] or "application/octet-stream"
         display_name = upload_info.get("name") or upload_info.get("original_name") or path
+        pdf_inline = None  # set by the PDF branch: where its full text lives
 
         if upload_handler.is_image_file(display_name, mime):
             try:
@@ -486,7 +593,7 @@ def build_user_content(
                         # Pull the PDF prose once — used as either intro_text
                         # (form path) or the doc body (plain path).
                         try:
-                            pdf_body_text = strip_pdf_content_marker(_process_pdf(path, owner=owner))
+                            pdf_body_text = strip_pdf_content_marker(_process_pdf(path, owner=owner, max_chars=None))
                         except Exception:
                             pdf_body_text = None
 
@@ -498,20 +605,12 @@ def build_user_content(
 
                         # Inline the PDF body in the chat content too. Without
                         # this, the assistant only saw the "PDF attached"
-                        # banner and had no idea what was inside — even though
-                        # the sidebar Document held the full extracted text.
-                        # Cap the inline copy so a multi-hundred-page PDF
-                        # doesn't blow the model's context; the sidebar still
-                        # carries the full body for direct reference.
-                        _MAX_INLINE_CHARS = 15000
+                        # banner and had no idea what was inside. The full body
+                        # goes in here; the shared inline budget trims it below
+                        # (_fit_pdf_inline) and points at the viewer document,
+                        # which holds every page, for the rest.
                         body_for_chat = (pdf_body_text or "").strip()
                         truncated_marker = ""
-                        if body_for_chat and len(body_for_chat) > _MAX_INLINE_CHARS:
-                            body_for_chat = body_for_chat[:_MAX_INLINE_CHARS]
-                            truncated_marker = (
-                                "\n[…truncated for inline context — full text "
-                                "available in the document viewer.]"
-                            )
 
                         if is_form:
                             fields = extract_fields(path)
@@ -521,7 +620,14 @@ def build_user_content(
                                 fields=fields,
                                 upload_id=os.path.basename(path),
                                 title=title,
-                                intro_text=pdf_body_text,
+                                # A form doc carries its fields after the intro and is
+                                # sent whole while open, so keep the intro at the size
+                                # it always had.
+                                intro_text=(
+                                    pdf_body_text[:15000] + "\n[PDF content truncated]"
+                                    if pdf_body_text and len(pdf_body_text) > 15000
+                                    else pdf_body_text
+                                ),
                             )
                             if doc_id:
                                 extracted_text = (
@@ -548,6 +654,16 @@ def build_user_content(
                                     extracted_text += (
                                         f"\n\n[PDF content — {title}]:\n{body_for_chat}{truncated_marker}"
                                     )
+
+                        # Plain PDF docs hold every page, so the inline note can
+                        # point at an exact offset. Form docs hold only the intro
+                        # and then the fields; they fall back to read_file.
+                        if doc_id and body_for_chat and not is_form:
+                            pdf_inline = {
+                                "doc_id": doc_id,
+                                "body": body_for_chat,
+                                "doc_body_start": _doc_body_start(doc_id, body_for_chat),
+                            }
 
                         if doc_id and auto_opened_docs is not None:
                             from src.database import SessionLocal, Document
@@ -581,11 +697,18 @@ def build_user_content(
                     owner=owner,
                 )
 
-            extracted_text, inline_attachment_remaining = _fit_inline_attachment_text(
-                extracted_text,
-                inline_attachment_remaining,
-                display_name,
-            )
+            # Split what's left evenly over the attachments still to come, so a
+            # multi-file upload shows the start of every file instead of all of
+            # the first and none of the last. Unused share rolls forward.
+            _allowance = inline_attachment_remaining // max(1, len(_attachment_ids) - _att_index)
+            if pdf_inline:
+                extracted_text, _used = _fit_pdf_inline(extracted_text, _allowance, display_name, pdf_inline)
+            else:
+                extracted_text, _ = _fit_inline_attachment_text(extracted_text, _allowance, display_name)
+                # Charge what actually went inline (an omitted file costs only
+                # its note), capped at this file's share.
+                _used = min(len(extracted_text), _allowance)
+            inline_attachment_remaining -= _used
             if content and content[0]["type"] == "text":
                 content[0]["text"] += extracted_text
             else:

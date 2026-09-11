@@ -281,12 +281,21 @@ class ChatHandler:
                             _m["vision"] = vl_desc
                             _m["vision_model"] = vl_model
 
+        # Size inline attachment text to the model's context window.
+        _ctx_tokens = None
+        if effective_att_ids and getattr(sess, "endpoint_url", None) and getattr(sess, "model", None):
+            try:
+                from src.model_context import get_context_length
+                _ctx_tokens = get_context_length(sess.endpoint_url, sess.model)
+            except Exception:
+                _ctx_tokens = None
         user_content = build_user_content(
             enhanced_message, effective_att_ids, UPLOAD_DIR, self.upload_handler,
             session_id=getattr(sess, "id", None),
             auto_opened_docs=auto_opened_docs,
             owner=owner,
             resolved_uploads=files_by_id,
+            context_tokens=_ctx_tokens,
         )
 
         # Strip image_url entries for text-only models (VL description is already in the text)

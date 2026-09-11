@@ -88,6 +88,13 @@ EXTRACT_SYSTEM_PROMPT = (
 # How many recent messages to include for extraction
 CONTEXT_WINDOW = 6
 
+# Per-message cap in the transcript sent for extraction. Durable facts come
+# from what the user typed, which leads the message; attached file text is
+# appended after it. Uncapped, a turn carrying a PDF resent the whole file
+# (~60k tokens): two minutes of prefill on a local server, with the user's
+# next message queued behind it.
+MAX_MESSAGE_CHARS = 2000
+
 AUDIT_SYSTEM_PROMPT = (
     "You are a memory database curator. Be CONSERVATIVE: remove only TRUE "
     "duplicates and clearly useless entries. Every distinct fact must survive. "
@@ -339,6 +346,8 @@ async def extract_and_store(
                     b.get("text", "") for b in c
                     if isinstance(b, dict) and b.get("type") == "text"
                 )
+            if isinstance(c, str) and len(c) > MAX_MESSAGE_CHARS:
+                c = c[:MAX_MESSAGE_CHARS] + "..."
             return f"{m.get('role', '?')}: {c}"
 
         transcript = "\n\n".join(_flatten_msg(m) for m in stripped_recent)

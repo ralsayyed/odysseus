@@ -38,6 +38,11 @@ DEFAULT_SETTINGS = {
     # recipients without confirmation.
     "agent_email_confirm": True,
     "image_gen_enabled": False,
+    # Local endpoints: offer every tool on every turn instead of per-turn
+    # selection, so the prompt start never changes and the server's prefix
+    # cache can reuse it across turns and chats (agent_loop._full_tool_set).
+    # Costs a larger fixed prompt, read once per server cache.
+    "agent_full_toolset_local": False,
     "image_model": "",
     "image_quality": "medium",
     "vision_model": "",

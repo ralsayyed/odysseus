@@ -1536,6 +1536,7 @@ def setup_chat_routes(
                         prompt_type=preset_id,
                         tools=None,
                         session_id=session,
+                        prefill_progress=True,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:
@@ -1562,6 +1563,8 @@ def setup_chat_routes(
                                     _actual_model = data.get("model") or _actual_model
                                     data["requested_model"] = _requested_model
                                     yield f'data: {json.dumps(data)}\n\n'
+                                elif data.get("type") == "prefill_progress":
+                                    yield chunk
                                 elif data.get("type") == "usage":
                                     last_metrics = data.get("data", {})
                                     _reported_model = last_metrics.get("model")
@@ -1574,6 +1577,12 @@ def setup_chat_routes(
                                         last_metrics["context_tokens_before_trim"] = ctx.context_tokens_before_trim
                                         last_metrics["context_tokens_after_trim"] = ctx.context_tokens_after_trim
                                     request_context_tokens = ctx.context_tokens_after_trim or estimate_tokens(messages)
+                                    # A server that reports cache accounting (llama.cpp,
+                                    # mlx-serve, OpenAI) puts the full prompt in
+                                    # prompt_tokens: the real context size, which the
+                                    # char-based estimate only approximates.
+                                    if last_metrics.get("cached_tokens") is not None and last_metrics.get("input_tokens"):
+                                        request_context_tokens = last_metrics["input_tokens"]
                                     last_metrics["request_context_tokens"] = request_context_tokens
                                     if ctx.context_length and request_context_tokens:
                                         pct = min(round((request_context_tokens / ctx.context_length) * 100, 1), 100.0)
@@ -1716,6 +1725,7 @@ def setup_chat_routes(
                         workspace=workspace or None,
                         forced_tools=_forced_tools,
                         uploaded_files=ctx.uploaded_files,
+                        prefill_progress=True,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:
@@ -1747,6 +1757,10 @@ def setup_chat_routes(
                                         _agent_rounds = max(_agent_rounds, data.get("round", 1))
                                     elif data.get("type") == "tool_start":
                                         _agent_tool_calls += 1
+                                    yield chunk
+                                elif data.get("type") == "prefill_progress":
+                                    # Live "reading prompt" progress; the client
+                                    # drives its spinner from it.
                                     yield chunk
                                 elif data.get("type") == "fallback":
                                     # Selected model failed; a fallback answered.

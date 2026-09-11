@@ -2160,13 +2160,20 @@ def _build_system_prompt(
             # front-matter pointer). Form-backed docs get a focused FORM MODE
             # prompt; everything else gets the regular generic doc context.
             _is_form_backed = False
+            _is_plain_pdf = False
             try:
                 from src.pdf_form_doc import find_source_upload_id
-                _is_form_backed = bool(find_source_upload_id(active_document.current_content or ""))
+                if find_source_upload_id(active_document.current_content or ""):
+                    # Both markers match; only pdf_form_source docs have fields.
+                    _kind = _pdf_doc_kind(active_document.current_content or "")
+                    _is_form_backed = _kind == "form"
+                    _is_plain_pdf = _kind == "plain"
             except Exception as e:
                 logger.warning("Failed to detect if document is form-backed, assuming plain", exc_info=e)
 
-            if _is_form_backed:
+            if _is_plain_pdf:
+                doc_ctx = _plain_pdf_doc_context(active_document)
+            elif _is_form_backed:
                 doc_ctx = (
                     f'ACTIVE PDF FORM (open in editor — the user is looking at this right now)\n'
                     f'Title: "{active_document.title}"\n'
@@ -2604,6 +2611,121 @@ _ADMIN_TOOLS = {
     "send_to_session", "pipeline", "ask_teacher", "list_models",
 }
 
+def _full_tool_set(mcp_mgr) -> Set[str]:
+    """Every tool the agent can offer: the fixed set for full-tool-set mode.
+
+    Used in place of per-turn selection when ``agent_full_toolset_local`` is on
+    and the endpoint is local. Local servers (mlx-serve, llama.cpp) reuse a
+    cached prompt only up to its first changed token, and the start of the
+    agent prompt -- the tool list, the tool-keyed rules, and the schemas the
+    chat template puts in the system turn -- is built from the offered tools.
+    Per-turn selection is too noisy to keep that stable (its embedding picks
+    for "Now do the same for the American Revolution." included send_email and
+    create_session), so every follow-up re-read the whole conversation.
+
+    The set must not vary by turn at all: this turn's deliberate removals are
+    enforced when a tool is called (see _turn_tool_blocks). Dropping their
+    schemas instead made the first follow-up after a PDF upload re-read the
+    whole conversation, 82k tokens with nothing cached.
+    """
+    names = {s.get("function", {}).get("name") for s in FUNCTION_TOOL_SCHEMAS} - {None}
+    if not get_setting("image_gen_enabled", False):
+        names.discard("generate_image")  # as _build_base_prompt does
+    if mcp_mgr:
+        try:
+            names |= {t["qualified_name"] for t in mcp_mgr.get_all_tools() if t.get("qualified_name")}
+        except Exception as exc:
+            logger.warning("Full tool set: could not list MCP tools: %s", exc)
+    return names
+
+
+# Why a tool is refused on a turn that deliberately removes it.
+_EXCLUSION_HINTS = {
+    "document": (
+        "not used on turns about the open document. Its text is in the document: "
+        "read it with `manage_documents` action=read, or edit it with edit_document."
+    ),
+    "email_draft": (
+        "not used while an email draft is open. The draft already holds the message "
+        "and the quoted history -- edit the draft instead of fetching the email again."
+    ),
+    "contact": "not used for this request. Save contact details with `manage_contact`.",
+}
+
+
+def _turn_tool_blocks(selected: Optional[Set[str]], excluded: Dict[str, str]) -> Dict[str, str]:
+    """Tools to refuse this turn, mapped to the message the model gets back.
+
+    ``excluded`` holds explicit prunes with their reason; an ALWAYS_AVAILABLE
+    tool the selection dropped was dropped on purpose (manage_memory for a
+    contact save). With no selection -- retrieval unavailable -- nothing was
+    dropped.
+    """
+    from src.tool_index import ALWAYS_AVAILABLE
+
+    blocks = {name: f"`{name}` is {hint}" for name, hint in (excluded or {}).items()}
+    if selected is not None:
+        for name in set(ALWAYS_AVAILABLE) - set(selected):
+            reason = _EXCLUSION_HINTS["contact"] if name == "manage_memory" else "not used for this request."
+            blocks.setdefault(name, f"`{name}` is {reason}")
+    return blocks
+
+
+def _pdf_doc_kind(content: str) -> Optional[str]:
+    """"form" for a fillable-PDF document, "plain" for any other imported PDF,
+    None for everything else.
+
+    find_source_upload_id() matches both front-matter markers, so on its own
+    it classed every plain PDF copy as a form.
+    """
+    head = (content or "")[:1000]
+    if "<!-- pdf_form_source" in head:
+        return "form"
+    if "<!-- pdf_source" in head:
+        return "plain"
+    return None
+
+
+_PDF_DOC_PREVIEW_CHARS = 4000
+
+
+def _plain_pdf_doc_context(doc) -> str:
+    """Context for an open plain-PDF document: its start plus how to read on.
+
+    The document holds the PDF's whole extracted text. This context is rebuilt
+    every turn near the end of the prompt, where the server's prefix cache
+    can't reuse it, so sending all of it re-read a 79-page transcript (~55k
+    tokens, minutes on a local server) on every follow-up -- and the FORM MODE
+    prompt it used to get told the model not to read the PDF at all.
+    """
+    content = doc.current_content or ""
+    title = re.search(r"^# .*$", content, re.M)
+    start = title.end() if title else 0
+    while start < len(content) and content[start] in "\r\n":
+        start += 1
+    body = content[start:]
+    preview = body[:_PDF_DOC_PREVIEW_CHARS]
+    pages = [int(n) for n in re.findall(r"\[Page (\d+) (?:text|image)", body)]
+    size = f"{max(pages)} pages, " if pages else ""
+    parts = [
+        "ACTIVE PDF (open in the viewer -- the user is looking at it right now)\n"
+        f'Title: "{doc.title}" | {size}{len(body):,} characters of extracted text',
+        f"```\n{preview}\n```",
+    ]
+    if len(body) > len(preview):
+        parts.append(
+            "That is only the start. Every page is in this document: read on with "
+            f"`manage_documents` action=read document_id={doc.id} offset={start + len(preview)} "
+            "-- each read returns next_offset. If the PDF was attached earlier in this "
+            "conversation, its text may already be in that message."
+        )
+    parts.append(
+        "Answer questions about this PDF from its text. Don't ask the user to paste or "
+        "re-upload it."
+    )
+    return "\n\n".join(parts)
+
+
 def _build_base_prompt(
     disabled_tools,
     mcp_mgr,
@@ -2850,6 +2972,7 @@ def _compute_final_metrics(
     backend_prefill_tps: float = 0,
     backend_prefill_tokens: Optional[int] = None,
     backend_cached_tokens: Optional[int] = None,
+    backend_prefill_ms: Optional[float] = None,
 ) -> dict:
     """Compute token counts, TPS, and build the final metrics dict."""
     if has_real_usage:
@@ -2875,7 +2998,13 @@ def _compute_final_metrics(
     # billing/usage counters. Some providers report only the final agent round
     # or cache-adjusted input, which made the displayed context jump from e.g.
     # 44% to 5% even when the session history had not meaningfully changed.
-    if request_context_tokens:
+    if last_round_input_tokens and backend_cached_tokens is not None:
+        # The server reported cache accounting (llama.cpp, mlx-serve, OpenAI),
+        # so its prompt_tokens is the last round's *full* prompt -- the real
+        # context size, not a cache-adjusted count -- and beats the char-based
+        # estimate below (4.3% estimated vs 11.0% real on one mlx-serve turn).
+        ctx_tokens = last_round_input_tokens
+    elif request_context_tokens:
         ctx_tokens = request_context_tokens
     elif last_round_input_tokens:
         ctx_tokens = last_round_input_tokens
@@ -2912,6 +3041,13 @@ def _compute_final_metrics(
         metrics["prefill_tokens"] = backend_prefill_tokens
     if backend_cached_tokens is not None:
         metrics["cached_tokens"] = backend_cached_tokens
+    if backend_prefill_ms is not None:
+        metrics["prefill_ms"] = round(backend_prefill_ms)
+        # The turn's rate from its totals rather than the last round's figure:
+        # every round prefills, and the last is usually a small warm one whose
+        # time is mostly cache restore.
+        if backend_prefill_tokens and backend_prefill_ms > 0:
+            metrics["prefill_tps"] = round(backend_prefill_tokens / backend_prefill_ms * 1000, 2)
     if prep_timings:
         prep_total = round(sum(prep_timings.values()), 3)
         metrics["agent_prep_time"] = prep_total
@@ -3112,6 +3248,7 @@ async def stream_agent_loop(
     forced_tools: Optional[Set[str]] = None,
     uploaded_files: Optional[List[Dict]] = None,
     workload: str = "foreground",
+    prefill_progress: bool = False,
     _is_teacher_run: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
@@ -3251,6 +3388,7 @@ async def stream_agent_loop(
                 timeout=int(get_setting("agent_stream_timeout_seconds", 300) or 300),
                 session_id=session_id,
                 workload=workload,
+                prefill_progress=prefill_progress,
             ):
                 if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                     try:
@@ -3320,6 +3458,8 @@ async def stream_agent_loop(
     # RAG-based tool selection: retrieve relevant tools for this query.
     # If caller provided a pre-computed set (e.g. task_scheduler), use that.
     _relevant_tools = relevant_tools
+    _turn_excluded: Dict[str, str] = {}  # tool -> why this turn removes it
+    _tool_set_pinned = False          # a mode fixed the exact tool set
     _t1 = time.time()
     if _relevant_tools:
         logger.info(f"[tool-rag] Using caller-provided relevant_tools ({len(_relevant_tools)} tools)")
@@ -3442,6 +3582,7 @@ async def stream_agent_loop(
             and not active_email
         ):
             _relevant_tools = set(_WORKSPACE_TERMINUS_TOOLS)
+            _tool_set_pinned = True
             logger.info("[tool-rag] Workspace file/terminal request; using Odysseus Terminus toolset")
 
     # If this turn targets the open document, keep editing tools available
@@ -3459,6 +3600,7 @@ async def stream_agent_loop(
                 "list_email_accounts", "list_emails", "read_email", "scan_email_unsubscribes",
                 "mcp__email__list_emails", "mcp__email__read_email", "mcp__email__scan_email_unsubscribes",
             }
+            _turn_excluded.update(dict.fromkeys(_email_fetch_tools, _EXCLUSION_HINTS["email_draft"]))
             removed = sorted(_relevant_tools & _email_fetch_tools)
             if removed:
                 _relevant_tools.difference_update(_email_fetch_tools)
@@ -3597,6 +3739,7 @@ async def stream_agent_loop(
             "run_shell",
             "write_file",
         }
+        _turn_excluded.update(dict.fromkeys(_doc_irrelevant_file_tools, _EXCLUSION_HINTS["document"]))
         _removed_doc_file_tools = sorted(_relevant_tools & _doc_irrelevant_file_tools)
         if _removed_doc_file_tools:
             _relevant_tools.difference_update(_doc_irrelevant_file_tools)
@@ -3681,6 +3824,32 @@ async def stream_agent_loop(
         _is_api_model = False
     else:
         _is_api_model = any(h in endpoint_url for h in _API_HOSTS) or _model_supports_tools
+    # Opt-in: offer the full tool set on local endpoints so the prompt start is
+    # identical on every turn and in every chat, and the server's prefix cache
+    # can reuse it (see _full_tool_set). Modes that pin an exact set, and
+    # caller-provided sets, are left exactly as chosen.
+    _full_toolset_mode = False
+    _turn_block_hints: Dict[str, str] = {}  # full-tool-set mode: tools refused this turn
+    if (
+        _is_api_model
+        and not guide_only
+        and not relevant_tools
+        and not _tool_set_pinned
+        and not (_ody_doc_finetune_mode or _ody_notes_finetune_mode or _ody_general_no_tool_mode)
+        and get_setting("agent_full_toolset_local", False)
+    ):
+        from src.model_context import is_local_endpoint
+        if is_local_endpoint(endpoint_url):
+            _full_toolset_mode = True
+            # This turn's removals are refused at call time rather than dropped
+            # from the list, so the prompt start stays identical.
+            _turn_block_hints = _turn_tool_blocks(_relevant_tools, _turn_excluded)
+            _relevant_tools = _full_tool_set(mcp_mgr)
+            logger.info(
+                "[agent-intent] full tool set for prefix caching: %d tools, refused this turn: %s",
+                len(_relevant_tools), sorted(_turn_block_hints),
+            )
+
     _compact_agent_prompt = _is_api_model or _is_ollama_native or _ollama_openai_compat
     messages, mcp_schemas = _build_system_prompt(
         messages, model, _prompt_active_document, mcp_mgr, disabled_tools,
@@ -3837,6 +4006,7 @@ async def stream_agent_loop(
     backend_prefill_tps = 0  # backend-reported prefill speed
     backend_prefill_tokens = None  # tokens actually prefilled, summed over rounds
     backend_cached_tokens = None   # prompt tokens served from KV cache, summed
+    backend_prefill_ms = None      # time spent prefilling, summed over rounds
     requested_model = model
     actual_model = model
     total_tool_calls = 0  # for budget enforcement
@@ -3931,6 +4101,11 @@ async def stream_agent_loop(
                     s for s in mcp_schemas
                     if s.get("function", {}).get("name") in _relevant_tools
                 ]
+                if _full_toolset_mode:
+                    # MCP servers connect in a different order after a
+                    # restart; sort so the schema block, and the server's
+                    # cache of it, survives one.
+                    _mcp_filtered.sort(key=lambda s: s.get("function", {}).get("name", ""))
                 all_tool_schemas = base_schemas + _mcp_filtered
             else:
                 base_schemas = FUNCTION_TOOL_SCHEMAS if _needs_admin else [
@@ -3993,6 +4168,7 @@ async def stream_agent_loop(
             timeout=agent_stream_timeout,
             session_id=session_id,
             workload=workload,
+            prefill_progress=prefill_progress,
         ):
             if not _round_first_event_logged:
                 _round_first_event_logged = True
@@ -4090,6 +4266,8 @@ async def stream_agent_loop(
                             backend_prefill_tokens = (backend_prefill_tokens or 0) + u["prefill_tokens"]
                         if u.get("cached_tokens") is not None:
                             backend_cached_tokens = (backend_cached_tokens or 0) + u["cached_tokens"]
+                        if u.get("prefill_ms") is not None:
+                            backend_prefill_ms = (backend_prefill_ms or 0) + u["prefill_ms"]
                     elif data.get("type") == "fallback":
                         # The selected model failed and another answered; surface
                         # the notice so a misconfigured provider isn't masked.
@@ -4100,6 +4278,11 @@ async def stream_agent_loop(
                     elif data.get("type") == "model_actual":
                         actual_model = data.get("model") or actual_model
                         data["requested_model"] = requested_model
+                        yield f"data: {json.dumps(data)}\n\n"
+                    elif data.get("type") == "prefill_progress":
+                        # Forward verbatim. Every agent round prefills, so this
+                        # also covers the waits between tool calls, not just
+                        # the first one.
                         yield f"data: {json.dumps(data)}\n\n"
                     elif "delta" in data:
                         if not first_token_received:
@@ -4654,6 +4837,14 @@ async def stream_agent_loop(
                     "blocked": True,
                 }
                 logger.info("Tool blocked before start by policy: %s", block.tool_type)
+            elif block.tool_type in _turn_block_hints:
+                desc = f"{block.tool_type}: BLOCKED"
+                result = {
+                    "error": _turn_block_hints[block.tool_type],
+                    "exit_code": 1,
+                    "blocked": True,
+                }
+                logger.info("Tool refused for this turn: %s", block.tool_type)
             else:
                 yield (
                     f'data: {json.dumps({"type": "tool_start", "tool": block.tool_type, "command": cmd_display, "full_command": full_command, "round": round_num})}\n\n'
@@ -5245,6 +5436,7 @@ async def stream_agent_loop(
         backend_prefill_tps=backend_prefill_tps,
         backend_prefill_tokens=backend_prefill_tokens,
         backend_cached_tokens=backend_cached_tokens,
+        backend_prefill_ms=backend_prefill_ms,
     )
     metrics["requested_model"] = requested_model
     yield f"data: {json.dumps({'type': 'metrics', 'data': metrics})}\n\n"

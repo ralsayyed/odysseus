@@ -2316,7 +2316,7 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
                 typewriterInto(roundHolder.querySelector('.body'), errMsg);
                 break;
               }
-              if (json.delta || json.type === 'agent_prep' || json.type === 'generated_image' || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'loop_breaker_triggered' || json.type === 'intent_nudge_exhausted' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
+              if (json.delta || json.type === 'agent_prep' || json.type === 'prefill_progress' || json.type === 'generated_image' || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'loop_breaker_triggered' || json.type === 'intent_nudge_exhausted' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
                 clearResponseTimeout();
                 clearProcessingProbe();
                 clearFirstTokenWaitTimers();
@@ -2330,6 +2330,43 @@ import { wireArrowUpRecall, getUserMessagesFromChatHistory } from './composerArr
                 if (!_isBg) {
                   _cancelThinkingTimer();
                   _replaceThinkingSpinner('Preparing agent');
+                }
+                continue;
+              }
+              if (json.type === 'prefill_progress') {
+                if (!_isBg) {
+                  const _pp = json.data || {};
+                  // The total is tokenized from the messages plus tool
+                  // schemas, which runs ~5% under the server's own count
+                  // (chat-template scaffolding). If a step overshoots it, a
+                  // percentage would pin at 99% and freeze, so show the
+                  // running token count instead.
+                  let _pct = null;
+                  let _overcount = _pp.total && _pp.processed >= _pp.total;
+                  if (_pp.total && !_overcount) {
+                    _pct = Math.min(99, Math.round((_pp.processed / _pp.total) * 100));
+                  }
+                  _cancelThinkingTimer();
+                  let _ppLabel;
+                  if (_pct !== null) {
+                    _ppLabel = `Reading prompt ${_pct}% · ${_pp.processed.toLocaleString()} of ${_pp.total.toLocaleString()} tokens`;
+                  } else if (_overcount) {
+                    _ppLabel = `Reading prompt · ${_pp.processed.toLocaleString()}+ tokens`;
+                  } else {
+                    _ppLabel = 'Reading prompt';
+                  }
+                  // Drive the spinner the user is actually watching: the
+                  // "Processing request" one created at send time. Updating
+                  // only the separate thinking-dots bubble left this stalled on
+                  // "Processing request" for the whole prefill, so progress was
+                  // invisible. Update it in place first; then keep the
+                  // thinking-dots bubble in sync if one is up.
+                  if (spinner && spinner.element && spinner.element.isConnected && !accumulated) {
+                    spinner.updateMessage(_ppLabel);
+                  }
+                  if (document.querySelector('.agent-thinking-dots')) {
+                    _replaceThinkingSpinner(_ppLabel);
+                  }
                 }
                 continue;
               }

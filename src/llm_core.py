@@ -2132,7 +2132,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                     tool_choice_none: bool = False, workload: str = "foreground"):
+                     tool_choice_none: bool = False, workload: str = "foreground",
+                     prefill_progress: bool = False):
     target_url = _stream_target_url(url)
     async with _local_model_slot(target_url, model, workload):
         async for chunk in _stream_llm_inner(
@@ -2147,6 +2148,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             tools=tools,
             session_id=session_id,
             tool_choice_none=tool_choice_none,
+            prefill_progress=prefill_progress,
         ):
             yield chunk
 
@@ -2155,7 +2157,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                             max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                             timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                             tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                            tool_choice_none: bool = False):
+                            tool_choice_none: bool = False, prefill_progress: bool = False):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -2525,6 +2527,24 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     try:
         client = _get_http_client()
         h = await apply_kimi_code_headers_async(client, h, target_url)
+
+        # Live prefill progress (mlx-serve with --metrics), only for callers
+        # that display it: background llm_call_async users skip the probe,
+        # /tokenize and polling entirely. The tracker's setup runs alongside
+        # the request, not before it -- no poll happens until the stream has
+        # been idle for POLL_INTERVAL, so a warm turn never waits on it.
+        from src import prefill_progress as _pp
+        _pp_tracker = None
+        if prefill_progress:
+            _pp_origin = _pp.origin_of(target_url)
+            if _pp_origin:
+                _pp_tracker = _pp.PrefillTracker(
+                    client,
+                    _pp_origin,
+                    _pp.prompt_text(payload.get("messages") or messages_copy, payload.get("tools")),
+                    h,
+                )
+
         async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
             _clear_host_dead(target_url)
             if r.status_code != 200:
@@ -2533,7 +2553,19 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                 yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
                 return
 
-            async for line in r.aiter_lines():
+            async for _evt_kind, line in _pp.stream_with_progress(
+                r.aiter_lines(),
+                _pp_tracker.poll if _pp_tracker is not None else None,
+                _pp.POLL_INTERVAL,
+                _pp_tracker.should_poll if _pp_tracker is not None else None,
+            ):
+                if _evt_kind == "progress":
+                    # A poll already in flight when output began can land just
+                    # after it; drop it rather than show prefill over a reply.
+                    if _pp_tracker is not None and not _pp_tracker.stopped:
+                        yield f'data: {json.dumps({"type": "prefill_progress", "data": line})}\n\n'
+                    continue
+
                 if not line:
                     continue
 
@@ -2580,6 +2612,12 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                     or _delta0.get("thinking")
                                     or _delta0.get("tool_calls")
                                 )
+                                # Any output -- visible text, reasoning or a tool
+                                # call -- means prefill is over; a pause after it
+                                # is decode, and a poll then could only pick up
+                                # another request's prefill.
+                                if _delta_has_output and _pp_tracker is not None:
+                                    _pp_tracker.stop()
                                 if "usage" in j and not _delta_has_output:
                                     u = j["usage"] or {}
                                     _usage_data = {"input_tokens": u.get("prompt_tokens", 0), "output_tokens": u.get("completion_tokens", 0)}
@@ -2592,29 +2630,42 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                     if isinstance(_tm, dict):
                                         if _tm.get("predicted_per_second"):
                                             _usage_data["gen_tps"] = round(_tm["predicted_per_second"], 2)
+                                        # llama.cpp and mlx-serve both compute this over the
+                                        # uncached tokens only, so it is a true prefill rate.
                                         if _tm.get("prompt_per_second"):
                                             _usage_data["prefill_tps"] = round(_tm["prompt_per_second"], 2)
-                                        # prompt_n is what was ACTUALLY prefilled this turn, which is
-                                        # not prompt_tokens once a KV-cache prefix is reused (54 billed
-                                        # vs 4 prefilled is normal on a follow-up turn). prefill_tps is
-                                        # measured over prompt_n alone, so the rate and the count only
-                                        # read honestly when shown together.
-                                        if _tm.get("prompt_n") is not None:
-                                            _usage_data["prefill_tokens"] = _tm["prompt_n"]
-                                        if _tm.get("cache_n") is not None:
-                                            _usage_data["cached_tokens"] = _tm["cache_n"]
-                                    # OpenAI-standard cached-prompt counter. llama.cpp mirrors
-                                    # timings.cache_n here and OpenAI reports its own prompt caching
-                                    # the same way, so cloud endpoints get the metric too. Preferred
-                                    # over cache_n when both are present.
+                                        if isinstance(_tm.get("prompt_ms"), (int, float)):
+                                            _usage_data["prefill_ms"] = round(_tm["prompt_ms"])
+                                    # Cached prompt tokens: the OpenAI-standard field first
+                                    # (llama.cpp, mlx-serve and OpenAI all send it), then the
+                                    # timings names -- mlx-serve says cached_n, llama.cpp cache_n.
                                     _ptd = u.get("prompt_tokens_details")
-                                    if isinstance(_ptd, dict) and _ptd.get("cached_tokens") is not None:
-                                        _usage_data["cached_tokens"] = _ptd["cached_tokens"]
+                                    _cached = _ptd.get("cached_tokens") if isinstance(_ptd, dict) else None
+                                    if _cached is None and isinstance(_tm, dict):
+                                        _cached = _tm.get("cached_n", _tm.get("cache_n"))
+                                    # Tokens actually prefilled = prompt minus cache, from usage
+                                    # rather than timings.prompt_n, because the servers disagree
+                                    # on prompt_n: llama.cpp counts only the uncached tokens,
+                                    # mlx-serve counts the whole prompt (7,050 on a warm turn
+                                    # whose own prefill counter moved by 31). The difference
+                                    # matched mlx-serve's prefill_tokens_total counter exactly on
+                                    # cold, warm and partial-cache requests.
+                                    if isinstance(_cached, int):
+                                        _usage_data["cached_tokens"] = _cached
+                                        _prompt_total = u.get("prompt_tokens")
+                                        if isinstance(_prompt_total, int):
+                                            _usage_data["prefill_tokens"] = max(_prompt_total - _cached, 0)
                                     if _actual_model:
                                         _usage_data["model"] = _actual_model
                                         if not _same_model_identity(_actual_model, model):
                                             _usage_data["requested_model"] = model
-                                    yield f'data: {json.dumps({"type": "usage", "data": _usage_data})}\n\n'
+                                    # usage is null on every chunk but the last in OpenAI-style
+                                    # streams (mlx-serve included), so the opening role chunk and
+                                    # the finish chunk land here too. Emitting those produced
+                                    # all-zero usage events, shown as metrics mid-reply, that also
+                                    # stopped chat mode from falling back to its own estimate.
+                                    if u:
+                                        yield f'data: {json.dumps({"type": "usage", "data": _usage_data})}\n\n'
                                 elif "choices" in j:
                                     _c0 = (j["choices"] or [None])[0]
                                     if _c0 is None:
@@ -2871,6 +2922,16 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
                 event_type == "tool_calls"
                 and bool(event_data.get("calls"))
             )
+
+            # Prefill progress describes the wait itself, so buffering it as
+            # metadata defeats the point — it would arrive in a burst alongside
+            # the first token it was meant to precede. It commits no candidate
+            # (no `emitted = True`), so fallback can still switch afterwards;
+            # a superseded candidate's progress is simply overwritten by the
+            # next one's, and any content or error replaces the spinner anyway.
+            if event_type == "prefill_progress":
+                yield chunk
+                continue
 
             if substantive and not emitted:
                 # First real output from a NON-primary candidate: tell the client

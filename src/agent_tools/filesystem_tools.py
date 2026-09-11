@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import re
@@ -130,6 +131,51 @@ class EditFileTool:
             result["diff"] = diff
         return result
 
+# (path, mtime, size) -> extracted text; PDFs are re-read while being paged.
+_PDF_TEXT_CACHE: Dict[Tuple[str, float, int], str] = {}
+
+
+def _is_pdf(path: str) -> bool:
+    if path.lower().endswith(".pdf"):
+        return True
+    try:
+        with open(path, "rb") as f:
+            return f.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
+def _pdf_text(path: str) -> str:
+    """A PDF's text, page by page, for read_file.
+
+    Opening a PDF as UTF-8 returned its raw bytes (``%PDF-1.7 ... stream``),
+    which is what the model got when told to read_file a truncated upload.
+    Extraction errors surface as OSError so read_file reports them cleanly.
+    """
+    st = os.stat(path)
+    key = (path, st.st_mtime, st.st_size)
+    if key not in _PDF_TEXT_CACHE:
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(path)
+            parts = [f"[PDF: {len(reader.pages)} pages. Use offset/limit (in lines) to page through it.]"]
+            for n, page in enumerate(reader.pages, 1):
+                parts.append(f"\n[Page {n}]\n{(page.extract_text() or '').strip()}")
+        except Exception as e:
+            raise OSError(f"could not extract PDF text: {e}") from e
+        if len(_PDF_TEXT_CACHE) >= 8:
+            _PDF_TEXT_CACHE.pop(next(iter(_PDF_TEXT_CACHE)))
+        _PDF_TEXT_CACHE[key] = "\n".join(parts) + "\n"
+    return _PDF_TEXT_CACHE[key]
+
+
+def _open_text(path: str):
+    """Text view of a file for read_file: extracted text for PDFs."""
+    if _is_pdf(path):
+        return io.StringIO(_pdf_text(path))
+    return open(path, "r", encoding="utf-8", errors="replace")
+
+
 class ReadFileTool:
     async def execute(self, content: str, ctx: dict) -> dict:
         from src.tool_execution import _resolve_tool_path, _resolve_search_root, _truncate
@@ -152,7 +198,7 @@ class ReadFileTool:
                 if offset > 0 or limit > 0:
                     start = max(offset, 1)
                     out, n, budget = [], 0, MAX_READ_CHARS
-                    with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    with _open_text(path) as f:
                         for i, line in enumerate(f, 1):
                             if i < start:
                                 continue
@@ -165,7 +211,7 @@ class ReadFileTool:
                                 out.append(f"\n... [truncated at {MAX_READ_CHARS} chars]")
                                 break
                     return "".join(out)
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                with _open_text(path) as f:
                     return f.read(MAX_READ_CHARS + 1)
             data = await asyncio.to_thread(_read)
         except FileNotFoundError:
